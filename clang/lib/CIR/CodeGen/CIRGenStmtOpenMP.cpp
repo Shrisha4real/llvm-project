@@ -518,6 +518,36 @@ CIRGenFunction::emitOMPMasterDirective(const OMPMasterDirective &s) {
                       s.getAssociatedStmt());
 }
 
+/// Emit the 'hint' clause of \p s, if any, into \p hintAttr. Returns failure,
+/// after emitting an error, if the hint cannot be represented. \p directive
+/// is the directive's name, for the diagnostic.
+static mlir::LogicalResult emitHintClause(CIRGenFunction &cgf,
+                                          const OMPExecutableDirective &s,
+                                          llvm::StringRef directive,
+                                          mlir::IntegerAttr &hintAttr) {
+  const auto *hint = s.getSingleClause<OMPHintClause>();
+  if (!hint)
+    return mlir::success();
+
+  uint64_t value =
+      hint->getHint()->EvaluateKnownConstInt(cgf.getContext()).getZExtValue();
+  // Sema accepts hints that combine uncontended (1) with contended (2), or
+  // nonspeculative (4) with speculative (8), but the omp dialect rejects
+  // them. OpenMP 5.0 [2.17.12] forbids these combinations, so Sema should
+  // diagnose them; once it does, this check can become an assertion.
+  if ((value & 0x3) == 0x3 || (value & 0xC) == 0xC) {
+    cgf.getCIRGenModule().errorNYI(
+        hint->getBeginLoc(),
+        (llvm::Twine("OpenMP ") + directive +
+         " 'hint' combining conflicting sync hints")
+            .str());
+    return mlir::failure();
+  }
+  hintAttr = mlir::IntegerAttr::get(
+      mlir::IntegerType::get(&cgf.getMLIRContext(), 64), value);
+  return mlir::success();
+}
+
 /// Find or create the module-level declaration of the critical section \p name.
 /// Returns null, after emitting an error, if the name is already used by
 /// another symbol or the hint cannot be represented.
@@ -537,21 +567,8 @@ getOrCreateCriticalDeclare(CIRGenFunction &cgf, const OMPCriticalDirective &s,
 
   mlir::omp::CriticalDeclareOperands clauseOps;
   clauseOps.symName = mlir::StringAttr::get(&cgf.getMLIRContext(), name);
-  if (const auto *hint = s.getSingleClause<OMPHintClause>()) {
-    uint64_t value =
-        hint->getHint()->EvaluateKnownConstInt(cgf.getContext()).getZExtValue();
-    // Sema accepts hints that combine uncontended (1) with contended (2), or
-    // nonspeculative (4) with speculative (8), but the omp dialect rejects
-    // them. OpenMP 5.0 [2.17.12] forbids these combinations, so Sema should
-    // diagnose them; once it does, this check can become an assertion.
-    if ((value & 0x3) == 0x3 || (value & 0xC) == 0xC) {
-      cgm.errorNYI(hint->getBeginLoc(),
-                   "OpenMP critical 'hint' combining conflicting sync hints");
-      return nullptr;
-    }
-    clauseOps.hint = mlir::IntegerAttr::get(
-        mlir::IntegerType::get(&cgf.getMLIRContext(), 64), value);
-  }
+  if (mlir::failed(emitHintClause(cgf, s, "critical", clauseOps.hint)))
+    return nullptr;
 
   mlir::OpBuilder modBuilder(mod.getBodyRegion());
   return mlir::omp::CriticalDeclareOp::create(modBuilder, loc, clauseOps);
@@ -725,20 +742,8 @@ CIRGenFunction::emitOMPAtomicDirective(const OMPAtomicDirective &s) {
     return mlir::failure();
 
   mlir::IntegerAttr hintAttr;
-  if (const auto *hint = s.getSingleClause<OMPHintClause>()) {
-    uint64_t value =
-        hint->getHint()->EvaluateKnownConstInt(getContext()).getZExtValue();
-    // The omp dialect rejects conflicting sync hints; Sema should diagnose
-    // them (OpenMP 5.0 [2.17.12]), after which this can become an assertion.
-    if ((value & 0x3) == 0x3 || (value & 0xC) == 0xC) {
-      getCIRGenModule().errorNYI(
-          hint->getBeginLoc(),
-          "OpenMP atomic 'hint' combining conflicting sync hints");
-      return mlir::failure();
-    }
-    hintAttr = mlir::IntegerAttr::get(
-        mlir::IntegerType::get(&getMLIRContext(), 64), value);
-  }
+  if (mlir::failed(emitHintClause(*this, s, "atomic", hintAttr)))
+    return mlir::failure();
 
   const Expr *xExpr = s.getX();
   if (!hasScalarEvaluationKind(xExpr->getType())) {

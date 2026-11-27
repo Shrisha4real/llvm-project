@@ -70,6 +70,12 @@ void conflicting_hint() {
   {}
 }
 
+void atomic_conflicting_hint(int x) {
+  // expected-error@+1{{ClangIR code gen Not Yet Implemented: OpenMP atomic 'hint' combining conflicting sync hints}}
+#pragma omp atomic hint(3)
+  x++;
+}
+
 void loop_continue(int *a) {
 #pragma omp parallel for
   for (int i = 0; i < 10; ++i) {
