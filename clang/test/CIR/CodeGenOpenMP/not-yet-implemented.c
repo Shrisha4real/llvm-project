@@ -29,6 +29,31 @@ void do_things() {
   { i = 1; }
 }
 
+// Only 'atomic update' is implemented. The other kinds, and the memory-order
+// clauses, are diagnosed rather than emitted as an update.
+void atomic_kinds(int *p) {
+  int v, x = 0;
+  // expected-error@+1{{ClangIR code gen Not Yet Implemented: OpenMP ATOMIC 'read' clause}}
+#pragma omp atomic read
+  v = x;
+
+  // expected-error@+1{{ClangIR code gen Not Yet Implemented: OpenMP ATOMIC 'write' clause}}
+#pragma omp atomic write
+  x = v;
+
+  // expected-error@+1{{ClangIR code gen Not Yet Implemented: OpenMP ATOMIC 'capture' clause}}
+#pragma omp atomic capture
+  v = x++;
+
+  // expected-error@+1{{ClangIR code gen Not Yet Implemented: OpenMP ATOMIC 'seq_cst' clause}}
+#pragma omp atomic seq_cst
+  x++;
+
+  // expected-error@+1{{ClangIR code gen Not Yet Implemented: OpenMP ATOMIC 'release' clause}}
+#pragma omp atomic update release
+  x++;
+}
+
 void use_clash() {
   clash();
   // A critical name shares the symbol table with functions.
