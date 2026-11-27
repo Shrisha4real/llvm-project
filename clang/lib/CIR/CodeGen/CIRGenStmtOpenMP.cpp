@@ -702,8 +702,89 @@ mlir::LogicalResult CIRGenFunction::emitOMPOrderedBlockAssocDirective(
 }
 mlir::LogicalResult
 CIRGenFunction::emitOMPAtomicDirective(const OMPAtomicDirective &s) {
-  getCIRGenModule().errorNYI(s.getSourceRange(), "OpenMP OMPAtomicDirective");
-  return mlir::failure();
+  mlir::Location begin = getLoc(s.getBeginLoc());
+  mlir::Location end = getLoc(s.getEndLoc());
+
+  omp::ConstructQueue queue =
+      omp::buildConstructQueue(getContext().getLangOpts().OpenMP, s);
+  omp::ConstructQueue::const_iterator item = queue.begin();
+
+  if (mlir::failed(checkSynthesizedClauses(*this, s, item)))
+    return mlir::failure();
+
+  OpenMPClauseEmitter ce(*this, getCIRGenModule(), builder, begin,
+                         item->clauses);
+  // Only 'atomic update' (the default) is implemented.
+  if (mlir::failed(ce.emitNYI</*supported=*/OMPUpdateClause, OMPHintClause>(
+          /*nyi=*/OpenMPNYIClauseList<
+              OMPCaptureClause, OMPReadClause, OMPWriteClause,
+              OMPCompareClause, OMPSeqCstClause, OMPAcqRelClause,
+              OMPAcquireClause, OMPReleaseClause, OMPRelaxedClause,
+              OMPWeakClause, OMPFailClause>{},
+          llvm::omp::Directive::OMPD_atomic)))
+    return mlir::failure();
+
+  mlir::IntegerAttr hintAttr;
+  if (const auto *hint = s.getSingleClause<OMPHintClause>()) {
+    uint64_t value =
+        hint->getHint()->EvaluateKnownConstInt(getContext()).getZExtValue();
+    // The omp dialect rejects conflicting sync hints; Sema should diagnose
+    // them (OpenMP 5.0 [2.17.12]), after which this can become an assertion.
+    if ((value & 0x3) == 0x3 || (value & 0xC) == 0xC) {
+      getCIRGenModule().errorNYI(
+          hint->getBeginLoc(),
+          "OpenMP atomic 'hint' combining conflicting sync hints");
+      return mlir::failure();
+    }
+    hintAttr = mlir::IntegerAttr::get(
+        mlir::IntegerType::get(&getMLIRContext(), 64), value);
+  }
+
+  const Expr *xExpr = s.getX();
+  if (!hasScalarEvaluationKind(xExpr->getType())) {
+    getCIRGenModule().errorNYI(xExpr->getSourceRange(),
+                               "OpenMP atomic update of non-scalar type");
+    return mlir::failure();
+  }
+  LValue xLValue = emitLValue(xExpr);
+  if (!xLValue.isSimple()) {
+    getCIRGenModule().errorNYI(xExpr->getSourceRange(),
+                               "OpenMP atomic update of non-simple lvalue");
+    return mlir::failure();
+  }
+  mlir::Value x = xLValue.getPointer();
+
+  // 'expr' in 'x binop= expr' is evaluated once, outside the atomic region.
+  RValue exprRValue = emitAnyExpr(s.getExpr());
+
+  const LangOptions &langOpts = getContext().getLangOpts();
+  mlir::omp::AtomicControlAttr atomicControl = mlir::omp::AtomicControlAttr::get(
+      &getMLIRContext(), langOpts.AtomicIgnoreDenormalMode,
+      langOpts.AtomicFineGrainedMemory, langOpts.AtomicRemoteMemory);
+
+  auto atomicOp = mlir::omp::AtomicUpdateOp::create(
+      builder, begin, x, atomicControl, hintAttr,
+      mlir::omp::ClauseMemoryOrderKindAttr{});
+
+  mlir::Block &block = atomicOp.getRegion().emplaceBlock();
+  mlir::Value oldValue =
+      block.addArgument(convertType(xExpr->getType()), begin);
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToEnd(&block);
+
+  // The update expression is 'OVE(x) binop OVE(expr)' or the reverse.
+  const auto *updateExpr = s.getUpdateExpr();
+  const auto *binOp = cast<BinaryOperator>(updateExpr->IgnoreImpCasts());
+  const auto *lhs = cast<OpaqueValueExpr>(binOp->getLHS()->IgnoreImpCasts());
+  const auto *rhs = cast<OpaqueValueExpr>(binOp->getRHS()->IgnoreImpCasts());
+  const OpaqueValueExpr *xOVE = s.isXLHSInRHSPart() ? lhs : rhs;
+  const OpaqueValueExpr *exprOVE = s.isXLHSInRHSPart() ? rhs : lhs;
+
+  OpaqueValueMapping mapExpr(*this, exprOVE, exprRValue);
+  OpaqueValueMapping mapX(*this, xOVE, RValue::get(oldValue));
+  RValue newValue = emitAnyExpr(updateExpr);
+  mlir::omp::YieldOp::create(builder, end, newValue.getValue());
+  return mlir::success();
 }
 
 /// Check for unsupported implicit captures in a target region.
